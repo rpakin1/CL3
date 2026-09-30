@@ -43,7 +43,94 @@ def assign_box_colors(df_box):
 
 
 # ------------------------------------------------------------------------------
-# 3. CORE DBL ALGORITHM (SINGLE-BOX PLACEMENT PER ITERATION)
+# 3. CORE SAFETY CHECK: CASCADING MULTI-LAYER LBSz SUPPORT
+# ------------------------------------------------------------------------------
+def check_multi_layer_cascade_lbsz(
+    candidate_x1,
+    candidate_y1,
+    candidate_z1,
+    candidate_bw,
+    candidate_bl,
+    candidate_bh,
+    candidate_weight,
+    placed_boxes,
+):
+  """คำนวณการถ่ายน้ำหนักสะสมแบบทับซ้อนหลายชั้น (Multi-layer Cascade)
+
+  เพื่อเช็กว่า LBSz ของกล่องชั้นล่างทุกใบโดนกดทับเกินขีดจำกัดหรือไม่
+  รองรับการวางเหลื่อมกันซ้อนกันกี่ชั้นก็ได้ตามสัดส่วนพื้นที่จริง (Proportional Area Ratio)
+  """
+  if candidate_z1 == 0:
+    return True  # วางบนพื้นตู้ ไม่กดทับกล่องอื่น
+
+  candidate_box = {
+      "x1": candidate_x1,
+      "y1": candidate_y1,
+      "z1": candidate_z1,
+      "x2": candidate_x1 + candidate_bw,
+      "y2": candidate_y1 + candidate_bl,
+      "z2": candidate_z1 + candidate_bh,
+      "weight_kg": candidate_weight,
+      "lbs_z": float("inf"),
+  }
+
+  # รวมกล่องทั้งหมดและเรียงลำดับจาก "สูงลงล่าง" (Top-Down by Z2)
+  all_boxes = placed_boxes + [candidate_box]
+  sorted_boxes = sorted(all_boxes, key=lambda b: b["z2"], reverse=True)
+
+  # Dictionary เก็บน้ำหนักกดทับสะสมที่แต่ละกล่องต้องแบกรับ (เริ่มต้น = น้ำหนักตัวเอง)
+  accumulated_loads = {id(b): b["weight_kg"] for b in all_boxes}
+
+  # ถ่ายทอดน้ำหนักจากชั้นบนลงชั้นล่างเป็นลูกโซ่ (Top-Down Propagation)
+  for top_b in sorted_boxes:
+    top_area = (top_b["x2"] - top_b["x1"]) * (top_b["y2"] - top_b["y1"])
+    if top_area <= 0:
+      continue
+
+    total_top_load = accumulated_loads[id(top_b)]
+
+    # หากล่องที่อยู่ชั้นล่างรองรับ top_b (ถือนำเฉพาะกล่องที่ z2 == top_b.z1)
+    under_boxes = []
+    total_overlap_area = 0.0
+
+    for bot_b in sorted_boxes:
+      if abs(bot_b["z2"] - top_b["z1"]) < 0.1:  # สัมผัสขอบบนพอดี
+        ox = max(0, min(top_b["x2"], bot_b["x2"]) - max(top_b["x1"], bot_b["x1"]))
+        oy = max(0, min(top_b["y2"], bot_b["y2"]) - max(top_b["y1"], bot_b["y1"]))
+        overlap = ox * oy
+        if overlap > 0:
+          under_boxes.append((bot_b, overlap))
+          total_overlap_area += overlap
+
+    # ถ่ายโอนน้ำหนักลงไปยังกล่องชั้นล่างตามสัดส่วนพื้นที่สัมผัสจริง
+    if total_overlap_area > 0:
+      for bot_b, overlap in under_boxes:
+        weight_share = total_top_load * (overlap / top_area)
+        accumulated_loads[id(bot_b)] += weight_share
+
+  # ตรวจสอบว่ามีกล่องใดกล่องหนึ่งในระบบถูกน้ำหนักสะสมกดทับเกินค่า LBS_z หรือไม่
+  for b in placed_boxes:
+    raw_lbs = b.get("lbs_z", float("inf"))
+    try:
+      b_lbs_z = (
+          float(raw_lbs)
+          if pd.notna(raw_lbs) and str(raw_lbs).strip() != ""
+          else float("inf")
+      )
+    except ValueError:
+      b_lbs_z = float("inf")
+
+    # น้ำหนักกดทับสุทธิ (ไม่รวมน้ำหนักตัวเองของกล่อง b)
+    load_on_b = accumulated_loads[id(b)] - b["weight_kg"]
+
+    if load_on_b > b_lbs_z:
+      return False  # น้ำหนักสะสมลงไปทำลายกล่องชั้นล่าง -> ปฏิเสธการวาง
+
+  return True
+
+
+# ------------------------------------------------------------------------------
+# 4. CORE DBL ALGORITHM (WITH SINGLE-BOX & MULTI-LAYER CASCADE SAFETY)
 # ------------------------------------------------------------------------------
 class EmptySpace:
 
@@ -115,7 +202,7 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
   )
 
   while space_list and any(qty > 0 for qty in boxes_in_stock.values()):
-    # Select Space: Min X1 -> Min Y1 -> Min Z1
+    # Select Space: Min X1 -> Min Y1 -> Min Z1 (ถมแนวกว้าง X -> ยาว Y -> สูง Z)
     space_list.sort(key=lambda s: (s.x1, s.y1, s.z1))
     space = space_list.pop(0)
 
@@ -174,27 +261,33 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
       for rot in filter(None, rotations):
         bw, bl, bh, rot_id = rot
 
-        # Single-box dimension fit check (Must fit at least 1 box)
+        # 1. เงื่อนไขเดิม: เช็กขนาดพื้นที่
         if bw > space.width or bl > space.length or bh > space.height:
           continue
 
-        # Nominal Weight Check
+        # 2. เงื่อนไขเดิม: เช็กน้ำหนักรวมของ Space
         if unit_weight > 0 and unit_weight > space.lbs_z:
           continue
 
-        # PRESSURE GATING CHECK (kg/cm^2)
+        # 3. เงื่อนไขเดิม: เช็กความหนาแน่นแรงดัน (Pressure Density kg/cm^2)
         box_footprint_area = bw * bl
         if box_footprint_area > 0 and unit_weight > 0:
           upper_weight_density = unit_weight / box_footprint_area
           if upper_weight_density > space.base_lbs_density:
             continue
 
-        # ----------------------------------------------------------------------
-        # SINGLE BOX PLACEMENT ENFORCED (EjeX = 1, EjeY = 1, EjeZ = 1)
-        # ----------------------------------------------------------------------
-        eje_x = 1
-        eje_y = 1
-        eje_z = 1
+        # 4. เงื่อนไขใหม่เสริม: ตรวจสอบน้ำหนักสะสมถ่ายทอดหลายชั้น (CASCADING MULTI-LAYER LBSz CHECK)
+        if not check_multi_layer_cascade_lbsz(
+            space.x1,
+            space.y1,
+            space.z1,
+            bw,
+            bl,
+            bh,
+            unit_weight,
+            placed_boxes,
+        ):
+          continue  # ถ้าน้ำหนักสะสมถ่ายทอดลงไปกดกล่องชั้นล่างเกิน LBS_z -> ข้ามลูป
 
         fit_x = space.width - bw
         fit_y = space.length - bl
@@ -220,7 +313,7 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
 
       box_color = box_colors_map.get(bp["box_id"], "#3380FF")
 
-      # Record single box placement
+      # บันทึกการวางทีละ 1 กล่อง
       x1, y1, z1 = space.x1, space.y1, space.z1
       placed_boxes.append({
           "Box_ID": bp["box_id"],
@@ -241,7 +334,7 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
           "label": f"{b_info['Box_Name']} | {b_info['Customer_Name']}",
       })
 
-      # Deduct 1 box from stock
+      # หักคลังสินค้าออกทีละ 1 กล่อง
       boxes_in_stock[bp["box_id"]] -= 1
 
       # Space B: Right of single box
@@ -320,7 +413,7 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
 
 
 # ------------------------------------------------------------------------------
-# 4. LDD CALCULATION FUNCTION
+# 5. LDD CALCULATION FUNCTION
 # ------------------------------------------------------------------------------
 def calculate_ldd(placed_boxes, container_info):
   if not placed_boxes:
@@ -364,7 +457,7 @@ def calculate_ldd(placed_boxes, container_info):
 
 
 # ------------------------------------------------------------------------------
-# 5. PLOTLY 3D RENDER ENGINE (ENHANCED HOVER TOOLTIP)
+# 6. PLOTLY 3D RENDER ENGINE (ENHANCED HOVER TOOLTIP)
 # ------------------------------------------------------------------------------
 def create_3d_cube_mesh(
     x1, y1, z1, x2, y2, z2, color, name_tag, box_details
@@ -466,7 +559,7 @@ def plot_interactive_container(container, placed_boxes, cg_x, cg_y):
 
 
 # ------------------------------------------------------------------------------
-# 6. READ MASTER DATA FROM GOOGLE SHEETS
+# 7. READ MASTER DATA FROM GOOGLE SHEETS
 # ------------------------------------------------------------------------------
 CONTAINER_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRFS2SNdgb2nBPQnwkyJRTGf2_9syexHsC3asjnkjhJOStVapomghBi9Ew9g5sYfohVoKVdghKajuCH/pub?gid=0&single=true&output=csv"
 BOX_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRFS2SNdgb2nBPQnwkyJRTGf2_9syexHsC3asjnkjhJOStVapomghBi9Ew9g5sYfohVoKVdghKajuCH/pub?gid=1420125949&single=true&output=csv"
@@ -551,12 +644,12 @@ df_container, df_box = load_master_data()
 box_colors_map = assign_box_colors(df_box)
 
 # ------------------------------------------------------------------------------
-# 7. APP MAIN INTERFACE
+# 8. APP MAIN INTERFACE
 # ------------------------------------------------------------------------------
 tab_user, tab_reports, tab_admin = st.tabs([
     "🚛 User View (3D Loading & LDD)",
     "📊 Reports & Export CSV",
-    "⚙️️ Admin (Master Data)",
+    "⚙️ Admin (Master Data)",
 ])
 
 st.sidebar.header("📋 Container & Cargo Selection")
