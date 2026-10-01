@@ -337,8 +337,8 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
   )
 
   while space_list and any(qty > 0 for qty in boxes_in_stock.values()):
-    # Select Space: Min X1 -> Min Y1 -> Min Z1
-    space_list.sort(key=lambda s: (s.x1, s.y1, s.z1))
+    # Select Space: Min Y1 -> Min X1 -> Min Z1
+    space_list.sort(key=lambda s: (s.y1, s.x1, s.z1))
     space = space_list.pop(0)
 
     best_fit = float("inf")
