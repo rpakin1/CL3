@@ -202,7 +202,7 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
   )
 
   while space_list and any(qty > 0 for qty in boxes_in_stock.values()):
-    # Select Space: Min X1 -> Min Z1 -> Min Y1 (ถมแนวกว้าง X -> ยาว Y -> สูง Z)
+    # Select Space: Min Y1 -> Min X1 -> Min Z1 (ถมแนวยาว Y -> กว้าง X -> สูง Z)
     space_list.sort(key=lambda s: (s.y1, s.x1, s.z1))
     space = space_list.pop(0)
 
